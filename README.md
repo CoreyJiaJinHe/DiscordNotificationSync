@@ -4,22 +4,22 @@ A lightweight, localized automation proxy built with Node.js and Playwright. It 
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
 * **Zero Self-Botting (TOS Compliant)**: Makes **no programmatic API calls** using user authorization tokens. All monitoring is done via passive DOM inspection inside a legitimate browser instance.
 * **Cloudflare & Anti-Bot Evasion**: Runs in headed mode (`headless: false`) using Playwright's `launchPersistentContext` and automation flags masking. Session cookies and LocalStorage are preserved in `./discord_profile`, requiring initial login/2FA only once.
 * **Smart State-Diffing Engine**: Tracks active unread sender IDs and per-server mention counts. **Will not spam alerts for pre-existing unreads** on startup—only fires when new messages arrive or mention counts increase. Silently updates state when messages are read.
 * **Flexible Filtering System**:
-* **DM Filtering**: Supports `ALLOWLIST`, `BLOCKLIST`, and `DISABLED` modes (matches display names, handles, or User IDs).
-* **Server Monitoring**: Target specific servers by name or Guild ID to alert on @mentions while ignoring general unread message channels.
-
-
+  * **DM Filtering**: Supports `ALLOWLIST`, `BLOCKLIST`, and `DISABLED` modes (matches display names, handles, or User IDs).
+  * **Server Monitoring**: Target specific servers by name or Guild ID to alert on @mentions while ignoring general unread message channels.
 * **Triple-Channel Alert Pipeline**:
-1. **Primary Route**: Discord Bot Direct Message (`discord.js`) to target account.
-2. **Backup Route**: Emergency HTTP Webhook POST request if the bot route fails.
-3. **Local Route**: Native Windows/macOS desktop toast notifications (`node-notifier`).
-
-
+  1. **Primary Route**: Discord Bot Direct Message (`discord.js`) to target account.
+  2. **Backup Route**: Emergency HTTP Webhook POST request if the bot route fails.
+  3. **Local Route**: Native Windows/macOS desktop toast notifications (`node-notifier`).
+* **Isolated Notification Management**:
+  * **Automated Rolling Buffer**: Keeps your DM clean by maintaining a configurable retention cap (`MAX_DM_HISTORY`). Older alerts are automatically pruned as new notifications arrive.
+  * **Signature Isolation**: Auto-pruning and cleanup commands strictly target proxy notification messages (`🔔 Account [...] Proxy Alert`). Non-proxy bot messages (e.g., game responses, trivia, or custom commands) remain untouched.
+  * **Interactive Command Panel**: Command listener with strict `!` prefix checking (`!help`, `!purge`, `!delete X`, `!keep X`) directly in Account A's DM.
 * **Dynamic Identity Resolution**: Scrapes and locks the active session's account display name or handle on startup for clear multi-account logging.
 * **Self-Healing & Debounced**: Automatic cooldown timer (`ALERT_COOLDOWN_MS`) prevents rate-limiting, and automatic navigation recovery handles page crashes or disconnects.
 
@@ -90,13 +90,16 @@ Create a `.env` file in the root directory and configure your settings:
 # ==========================================
 DISCORD_BOT_TOKEN=your_discord_bot_token_here
 TARGET_USER_ID=your_account_a_discord_user_id_here
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...  # Optional backup route
+DISCORD_WEBHOOK_URL=[https://discord.com/api/webhooks/](https://discord.com/api/webhooks/)...  # Optional backup route
 
 # ==========================================
-# ALERT SETTINGS
+# ALERT & RETENTION SETTINGS
 # ==========================================
 # Cooldown period in milliseconds between alerts (Default: 60000 = 60s)
 ALERT_COOLDOWN_MS=60000
+
+# Number of recent proxy notification alerts to keep in DM history (0 = disable auto-trim)
+MAX_DM_HISTORY=10
 
 # ==========================================
 # DM FILTERING RULES
@@ -117,12 +120,27 @@ FILTER_SERVERS=My Community Server,987654321098765432
 
 ---
 
+## Interactive Bot Commands
+
+You can manage proxy notification history directly from Account A by sending Direct Messages to the bot.
+
+> **Safety Isolation:** Commands and automated cleanup target **ONLY** proxy alert notifications (`🔔 Account [...] Proxy Alert`). If you reuse this bot for games, trivia, or other tasks, those non-proxy messages will **NEVER** be deleted.
+
+| Command | Action | Description |
+| --- | --- | --- |
+| `!help` | Menu & Status | Displays active monitored account name, current retention cap, and command list. |
+| `!purge` | Purge All Alerts | Deletes **ALL** past proxy alert notifications from DM history. |
+| `!delete <X>` | Delete Recent | Deletes the **X most recent** proxy alert notifications (e.g., `!delete 5`). |
+| `!keep <X>` | Retain Buffer | Keeps the **X most recent** proxy alerts and deletes all older alerts (e.g., `!keep 10`). |
+
+---
+
 ## Running the Application
 
 ### First-Time Initialization (Session Setup)
 
 1. Start `index.js` manually or run `launch_discord.bat`.
-2. A Chromium browser window will open and navigate to `[https://discord.com/app](https://discord.com/app)`.
+2. A Chromium browser window will open and navigate to `https://discord.com/app`.
 3. Log in to **Account B** (the secondary account to monitor).
 4. Complete any 2FA requirements.
 5. Once logged in, the script will automatically resolve your account identity and start passive DOM polling.
@@ -177,6 +195,11 @@ For persistent background running and automated management on Windows, PM2 can b
       ▼                    ▼                    ▼
  Native OS Toast    Cloud Discord Bot DM   HTTP Webhook
 (node-notifier)       (discord.js)           (Backup)
+                           │
+                           ▼
+             Automated Rolling Buffer
+            (Keeps newest MAX_DM_HISTORY
+            Proxy Alert Notifications)
 
 ```
 
@@ -188,6 +211,7 @@ For persistent background running and automated management on Windows, PM2 can b
 
 3. **State Tracking**: Scanner results are diffed against stored state (`prevDmKeys` and `prevServerStateMap`). Alerts trigger **only** on new items or count increases.
 4. **Alert Dispatch**: Passes filter checks (`shouldAlertForSender` / `shouldAlertForServer`), respects `ALERT_COOLDOWN_MS`, and dispatches across configured channels.
+5. **Notification Cleanup**: Post-dispatch, the bot checks DM history for proxy signature matches (`isProxyAlertMessage`) and automatically enforces the `MAX_DM_HISTORY` retention limit.
 
 ---
 

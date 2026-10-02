@@ -54,6 +54,82 @@ async function initBot() {
         });
     });
 }
+bot.on('messageCreate', async (message) => {
+    // Restrict strictly to Account A in Direct Messages
+    if (message.author.id !== CONFIG.targetUserId || message.guild) return;
+
+    const content = message.content.trim();
+
+    // ------------------------------------------------------------------
+    // COMMAND: !help
+    // ------------------------------------------------------------------
+    if (content.toLowerCase() === '!help') {
+        const helpText = [
+            `🤖 **Discord DM Proxy Control Panel**`,
+            `Currently Monitoring Account: **${currentAccountName || 'Initializing...'}**`,
+            ``,
+            `**Available Notification Commands:**`,
+            `• \`!purge\` — Delete **ALL** proxy alert notifications.`,
+            `• \`!delete <X>\` — Delete the **X most recent** proxy alert notifications.`,
+            `• \`!keep <X>\` — Keep only the **X most recent** proxy alerts (deletes all older alerts).`,
+            `• \`!help\` — Display this menu.`,
+            ``,
+            `*Note: Commands strictly target proxy alert notifications and will never delete non-proxy bot messages.*`
+        ].join('\n');
+
+        await message.reply(helpText);
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // COMMAND: !purge (Delete ALL proxy notifications)
+    // ------------------------------------------------------------------
+    if (content.toLowerCase() === '!purge') {
+        const statusMsg = await message.reply(`🧹 *Purging ALL proxy alert notifications...*`);
+        const deletedCount = await manageProxyAlerts(CONFIG.targetUserId, 'PURGE_ALL');
+
+        await statusMsg.edit(`✅ *Purged ${deletedCount} proxy alert notification(s).*`);
+        setTimeout(() => {
+            statusMsg.delete().catch(() => {});
+            message.delete().catch(() => {});
+        }, 4000);
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // COMMAND: !delete <X> (Delete X most recent proxy notifications)
+    // ------------------------------------------------------------------
+    const deleteMatch = content.match(/^!delete\s+(\d+)$/i);
+    if (deleteMatch) {
+        const amount = parseInt(deleteMatch[1], 10);
+        const statusMsg = await message.reply(`🧹 *Deleting the ${amount} most recent proxy alert(s)...*`);
+        const deletedCount = await manageProxyAlerts(CONFIG.targetUserId, 'DELETE_RECENT', amount);
+
+        await statusMsg.edit(`✅ *Deleted ${deletedCount} recent proxy alert(s).*`);
+        setTimeout(() => {
+            statusMsg.delete().catch(() => {});
+            message.delete().catch(() => {});
+        }, 4000);
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // COMMAND: !keep <X> (Keep X most recent proxy notifications, purge older)
+    // ------------------------------------------------------------------
+    const keepMatch = content.match(/^!keep\s+(\d+)$/i);
+    if (keepMatch) {
+        const amount = parseInt(keepMatch[1], 10);
+        const statusMsg = await message.reply(`🧹 *Trimming proxy alerts to keep newest ${amount}...*`);
+        const deletedCount = await manageProxyAlerts(CONFIG.targetUserId, 'KEEP_RECENT', amount);
+
+        await statusMsg.edit(`✅ *Removed ${deletedCount} older proxy alert(s).*`);
+        setTimeout(() => {
+            statusMsg.delete().catch(() => {});
+            message.delete().catch(() => {});
+        }, 4000);
+        return;
+    }
+});
 
 // ==========================================
 // 3. DUAL-CHANNEL ALERT ROUTER
@@ -77,7 +153,8 @@ async function triggerAlert(title, message) {
 
     // Update cooldown timestamp
     lastAlertTime = now;
-    console.log(`[Alert Fired] ${title}: ${message}`);
+    const timestamp = new Date().toLocaleString();
+    console.log(`[${timestamp}] [Alert Fired] ${title}: ${message}`);
 
     // ------------------------------------------------------------------
     // Action A: Local OS Desktop Toast Notification (Native Windows/Mac)
@@ -99,6 +176,13 @@ async function triggerAlert(title, message) {
             await user.send(`🔔 Account **[${currentAccountName} Proxy Alert]**\n${message}`);
             console.log(`[Bot Route] Direct Message successfully delivered to ${user.tag || user.username}.`);
             botSuccess = true;
+
+            // Trigger non-blocking rolling buffer cleanup
+            if (CONFIG.maxDmHistory > 0) {
+                manageProxyAlerts(CONFIG.targetUserId, 'KEEP_RECENT', CONFIG.maxDmHistory).catch(err => {
+                    console.error('[Background Alert Buffer Error]:', err.message);
+                });
+            }
         } else {
             console.warn('[Bot Route] Could not locate target user with provided TARGET_USER_ID.');
         }
@@ -112,7 +196,7 @@ async function triggerAlert(title, message) {
     // ------------------------------------------------------------------
     if (!botSuccess && CONFIG.webhookUrl) {
         try {
-            console.log('[Webhook Route] Attempting emergency alert dispatch via HTTP Webhook...');
+            console.log(`[${timestamp}] [Webhook Route] Attempting emergency alert dispatch via HTTP Webhook...`);
             const response = await fetch(CONFIG.webhookUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -130,6 +214,85 @@ async function triggerAlert(title, message) {
             console.error('[Webhook Route Failure] Failed to dispatch backup webhook:', err.message);
         }
     }
+}
+
+/**
+ * Manages proxy alert messages in the DM channel without touching other bot messages.
+ * 
+ * @param {string} targetUserId - Account A User ID
+ * @param {'PURGE_ALL' | 'DELETE_RECENT' | 'KEEP_RECENT'} action
+ * @param {number} [count=0] - Number of messages for DELETE_RECENT or KEEP_RECENT
+ * @returns {Promise<number>} Number of deleted messages
+ */
+async function manageProxyAlerts(targetUserId, action, count = 0) {
+    try {
+        const user = await bot.users.fetch(targetUserId);
+        if (!user) return 0;
+
+        const dmChannel = await user.createDM();
+        const fetchedMessages = await dmChannel.messages.fetch({ limit: 100 });
+
+        // Filter STRICTLY to proxy notification alerts authored by this bot
+        const alertMessages = Array.from(fetchedMessages.values())
+            .filter(isProxyAlertMessage)
+            .sort((a, b) => b.createdTimestamp - a.createdTimestamp); // Newest first
+
+        if (alertMessages.length === 0) return 0;
+
+        let toDelete = [];
+
+        switch (action) {
+            case 'PURGE_ALL':
+                // Delete ALL proxy alert notifications
+                toDelete = alertMessages;
+                break;
+
+            case 'DELETE_RECENT':
+                // Delete the X most recent proxy alert notifications
+                toDelete = alertMessages.slice(0, count);
+                break;
+
+            case 'KEEP_RECENT':
+                // Keep the X most recent proxy alerts, delete all older proxy alerts
+                toDelete = alertMessages.slice(count);
+                break;
+
+            default:
+                return 0;
+        }
+
+        if (toDelete.length === 0) return 0;
+
+        let deletedCount = 0;
+        for (const msg of toDelete) {
+            try {
+                await msg.delete();
+                deletedCount++;
+                // Pace deletions to prevent Discord API rate limits (~400ms delay)
+                await new Promise(resolve => setTimeout(resolve, 400));
+            } catch (err) {
+                console.warn(`[DM Cleanup Warning] Could not delete message ID ${msg.id}:${err.message}`);
+            }
+        }
+
+        return deletedCount;
+
+    } catch (err) {
+        console.error('[DM Management Failure] Failed to manage proxy alerts:', err.message);
+        return 0;
+    }
+}
+
+/**
+ * Checks if a message was authored by this bot and is a Proxy Notification.
+ * Matches the signature header: 🔔 Account **[... Proxy Alert]**
+ */
+function isProxyAlertMessage(msg) {
+    return (
+        msg.author.id === bot.user.id &&
+        msg.content.includes('Proxy Alert') &&
+        msg.content.startsWith('🔔 Account')
+    );
 }
 
 // ==========================================
@@ -335,7 +498,7 @@ async function startMonitoring() {
     setInterval(async () => {
         try {
             if (page.isClosed()) return;
-
+            const timestamp = new Date().toLocaleString();
             // Execute in-browser DOM scraping logic to identify unread DMs and server mentions
             const scanResult = await page.evaluate(() => {
                 const senders = [];
@@ -440,7 +603,6 @@ async function startMonitoring() {
             });
 
             if (scanResult.senders.length > 0 || scanResult.servers.length > 0) {
-                const timestamp = new Date().toLocaleString();
                 console.log(`[${timestamp}] [DOM Scan] Found ${scanResult.senders.length} unread DM(s), ${scanResult.servers.length} server mention(s).`);
             }
 
@@ -461,7 +623,7 @@ async function startMonitoring() {
 
             for (const sender of scanResult.senders) {
                 if (!shouldAlertForSender(sender)) {
-                    console.log(`[Filter Suppressed] Ignored message from "${sender.name || 'Unknown'}" matching ${CONFIG.filterMode} rules.`);
+                    console.log(`[${timestamp}] [Filter Suppressed] Ignored message from "${sender.name || 'Unknown'}" matching ${CONFIG.filterMode} rules.`);
                 }
             }
 
@@ -506,7 +668,7 @@ async function startMonitoring() {
 
             for (const server of scanResult.servers) {
                 if (!shouldAlertForServer(server)) {
-                    console.log(`[Server Suppressed] Ignored unread activity in server "${server.name}" (ID: ${server.id || 'N/A'}).`);
+                    console.log(`[${timestamp}] [Server Suppressed] Ignored unread activity in server "${server.name}" (ID: ${server.id || 'N/A'}).`);
                 }
             }
 
