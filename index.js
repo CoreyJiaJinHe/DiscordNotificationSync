@@ -20,10 +20,14 @@ const CONFIG = {
         .split(',')
         .map((item) => item.trim().toLowerCase())
         .filter(Boolean),
+    filterServers: (process.env.FILTER_SERVERS || '')
+        .split(',')
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean),
 };
 
-
 let lastAlertTime = 0;
+let currentAccountName = 'Account B'; // Dynamic state updated via one-time startup scraper
 
 // Initialize discord.js Bot Client
 const bot = new Client({
@@ -92,8 +96,8 @@ async function triggerAlert(title, message) {
     try {
         const user = await bot.users.fetch(CONFIG.targetUserId);
         if (user) {
-            await user.send(`🔔 **[Account B Proxy Alert]**\n${message}`);
-            console.log('[Bot Route] Direct Message successfully delivered to Account A.');
+            await user.send(`🔔 Account **[${currentAccountName} Proxy Alert]**\n${message}`);
+            console.log(`[Bot Route] Direct Message successfully delivered to ${user.tag || user.username}.`);
             botSuccess = true;
         } else {
             console.warn('[Bot Route] Could not locate target user with provided TARGET_USER_ID.');
@@ -113,7 +117,7 @@ async function triggerAlert(title, message) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    content: `⚠️ **[Backup Route - Account B Proxy]**\n${message}`,
+                    content: `⚠️ Account **[${currentAccountName} Backup Route]**\n${message}`,
                 }),
             });
 
@@ -129,10 +133,10 @@ async function triggerAlert(title, message) {
 }
 
 // ==========================================
-// 4. SENDER FILTER EVALUATOR
+// 4. FILTER EVALUATORS (SENDER & SERVER)
 // ==========================================
 /**
- * Evaluates scraped sender metadata against configuration rules (Username, Display Name, and User ID).
+ * Evaluates scraped DM sender metadata against configuration rules (Username, Display Name, and User ID).
  * 
  * @param {Object} sender - An object containing { name: string, id: string|null }
  * @returns {boolean} - Returns true if the message should trigger an alert, false if suppressed
@@ -168,12 +172,120 @@ function shouldAlertForSender(sender) {
     return true;
 }
 
+/**
+ * Evaluates scraped server metadata against target server configuration (Server Name or Server ID).
+ * 
+ * @param {Object} server - An object containing { name: string, id: string|null, mentionCount: string|null }
+ * @returns {boolean} - Returns true if the server matches monitoring rules
+ */
+function shouldAlertForServer(server) {
+    if (CONFIG.filterServers.length === 0) {
+        return false; // Server mention monitoring is disabled if no target servers are specified
+    }
+
+    const nameMatch = server.name
+        ? CONFIG.filterServers.some((target) => server.name.toLowerCase().includes(target))
+        : false;
+
+    const idMatch = server.id
+        ? CONFIG.filterServers.some((target) => server.id.toLowerCase() === target)
+        : false;
+
+    return nameMatch || idMatch;
+}
+
 // ==========================================
-// 5. BROWSER AUTOMATION & DOM MONITOR
+// 5. ONE-TIME ACCOUNT IDENTITY RESOLUTION
+// ==========================================
+/**
+ * Resolves the logged-in user's account name from Discord's DOM once upon startup.
+ * Retries every 3 seconds until the user panel renders, locking the name into memory.
+ * 
+ * @param {import('playwright').Page} page - Active Playwright page object
+ * @returns {Promise<string>} - Resolves with the extracted account name
+ */
+async function resolveAccountName(page) {
+    console.log('[Browser] Resolving logged-in account name...');
+    let resolvedName = null;
+    let attempt = 0;
+
+    while (!resolvedName) {
+        attempt++;
+        console.log(`\n--- [Debug] Attempt #${attempt} ---`);
+
+        try {
+            if (page.isClosed()) {
+                console.log('[Debug] Page is closed. Returning fallback "Account B".');
+                return 'Account B';
+            }
+
+            console.log(`[Debug] Current URL: "${page.url()}"`);
+
+            const result = await page.evaluate(() => {
+                const diag = {
+                    panelFound: false,
+                    displayNameNodeFound: false,
+                    displayNameRaw: null,
+                    handleNodeFound: false,
+                    handleRaw: null,
+                    foundName: null
+                };
+
+                // Match exact section or fallback panel class
+                const panel = document.querySelector('section[aria-label*="User status"], [class*="panels_"]');
+                if (panel) {
+                    diag.panelFound = true;
+
+                    // 1. Display Name (e.g. "Neptune")
+                    const displayNameNode = panel.querySelector('[class*="nameTag_"] [class*="title_"], [class*="panelTitleContainer_"]');
+                    if (displayNameNode) {
+                        diag.displayNameNodeFound = true;
+                        diag.displayNameRaw = displayNameNode.textContent;
+                        if (displayNameNode.textContent.trim()) {
+                            diag.foundName = displayNameNode.textContent.trim();
+                            return diag;
+                        }
+                    }
+
+                    // 2. Handle Fallback (e.g. "neptune06594")
+                    const handleNode = panel.querySelector('[class*="hovered_"]');
+                    if (handleNode) {
+                        diag.handleNodeFound = true;
+                        diag.handleRaw = handleNode.textContent;
+                        if (handleNode.textContent.trim()) {
+                            diag.foundName = handleNode.textContent.trim();
+                            return diag;
+                        }
+                    }
+                }
+
+                return diag;
+            });
+
+            console.log('[Debug] DOM Scan Results:', JSON.stringify(result, null, 2));
+
+            if (result && result.foundName) {
+                resolvedName = result.foundName;
+            } else {
+                console.log('[Debug] Name not resolved yet. Retrying in 3 seconds...');
+                await page.waitForTimeout(3000);
+            }
+        } catch (err) {
+            console.error(`[Debug Exception] Error during resolution loop: ${err.message}`);
+            await page.waitForTimeout(3000);
+        }
+    }
+
+    console.log(`[Account Identified] Active session username locked: "${resolvedName}"`);
+    return resolvedName;
+}
+
+// ==========================================
+// 6. BROWSER AUTOMATION & DOM MONITOR
 // ==========================================
 /**
  * Launches the Playwright browser instance, manages persistent login context,
- * and maintains a continuous DOM monitoring loop for unread indicators and sender metadata.
+ * resolves account identity once, and maintains a passive DOM polling loop for unread DMs and server mentions.
  */
 async function startMonitoring() {
     console.log('[Browser] Launching Headed Persistent Browser Context...');
@@ -203,8 +315,14 @@ async function startMonitoring() {
 
     await navigateToDiscord();
 
+    // ------------------------------------------------------------------
+    // Identity Initialization (One-Time Execution)
+    // ------------------------------------------------------------------
+    currentAccountName = await resolveAccountName(page);
+
     console.log(`[Monitor] Passive DOM Poller Active.`);
-    console.log(`[Monitor] Filter Configuration -> Mode: ${CONFIG.filterMode} | Targets: [${CONFIG.filterTargets.join(', ')}]`);
+    console.log(`[Monitor] DM Filter Configuration -> Mode: ${CONFIG.filterMode} | Targets: [${CONFIG.filterTargets.join(', ')}]`);
+    console.log(`[Monitor] Server Filter Targets -> [${CONFIG.filterServers.join(', ')}]`);
 
     // ------------------------------------------------------------------
     // Passive DOM Polling Loop
@@ -213,24 +331,25 @@ async function startMonitoring() {
         try {
             if (page.isClosed()) return;
 
-            // Execute in-browser DOM scraping logic to identify unread badges, channel names, and user IDs
-            const unreadSenders = await page.evaluate(() => {
+            // Execute in-browser DOM scraping logic to identify unread DMs and server mentions
+            const scanResult = await page.evaluate(() => {
                 const senders = [];
+                const servers = [];
 
-                // Target all DM links in Discord's left sidebar
+                // 1. Target all DM links in Discord's left sidebar
                 const dmItems = document.querySelectorAll('a[href^="/channels/@me/"]');
                 console.log("[DOM SCAN] Scanning for DM items. Total found:", dmItems.length);
                 dmItems.forEach((item) => {
                     const href = item.getAttribute('href') || '';
                     const ariaLabel = item.getAttribute('aria-label') || '';
 
-                    // 1. Check for Unread Status using multiple signals
+                    // Check for Unread Status using multiple signals
                     const hasUnreadClass = item.querySelector('[class*="unread"], [class*="numberBadge"], [class*="pill"], [class*="badge"]') !== null;
                     const hasUnreadAria = ariaLabel.toLowerCase().includes('unread');
                     const isUnread = hasUnreadClass || hasUnreadAria;
-                    
+
                     if (isUnread) {
-                        // 2. Extract User ID directly from href (/channels/@me/123456789012345678)
+                        // Extract User ID directly from href (/channels/@me/123456789012345678)
                         const hrefSegments = href.split('/').filter(Boolean);
                         let extractedId = hrefSegments[hrefSegments.length - 1];
 
@@ -244,10 +363,8 @@ async function startMonitoring() {
                             }
                         }
 
-                        // 3. Extract Display Name from DOM or clean aria-label
+                        // Extract Display Name from DOM or clean aria-label
                         let nameText = '';
-
-                        // Try inner text elements first
                         const textNodes = item.querySelectorAll('span, div');
                         for (const node of textNodes) {
                             // Ignore badge numbers and grab actual name strings
@@ -260,7 +377,6 @@ async function startMonitoring() {
                             }
                         }
 
-                        // Fallback: Parse name directly from aria-label (e.g. "Alex, 1 unread message" -> "Alex")
                         if (!nameText && ariaLabel) {
                             nameText = ariaLabel.split(',')[0].replace(/\(unread\)/i, '').trim();
                         }
@@ -271,15 +387,62 @@ async function startMonitoring() {
                     }
                 });
 
-                return senders;
+                // 2. Target Guild / Server items in the Server Navigation Rail
+                const serverRail = document.querySelector('[role="group"][aria-label="Servers"], nav[aria-label*="Servers"], [class*="guilds_"]');
+                const serverItems = serverRail
+                    ? serverRail.querySelectorAll('[data-list-item-id^="guildsnav___"], [role="treeitem"]')
+                    : document.querySelectorAll('[data-list-item-id^="guildsnav___"]');
+
+                serverItems.forEach((item) => {
+                    // Parent listItem container holds both the icon treeitem and lowerBadge
+                    const parentItem = item.closest('[class*="listItem_"]') || item;
+
+                    // Extract Guild ID from data-list-item-id="guildsnav___698278375952744584"
+                    const listItemId = item.getAttribute('data-list-item-id') || '';
+                    const idMatch = listItemId.match(/guildsnav___(\d+)/);
+                    const guildId = idMatch ? idMatch[1] : null;
+
+                    if (!guildId) return;
+
+                    // 1. Extract Server Name directly from data-dnd-name attribute
+                    const dndEl = parentItem.querySelector('[data-dnd-name]') || item.closest('[data-dnd-name]');
+                    let serverName = dndEl ? dndEl.getAttribute('data-dnd-name') : null;
+
+                    // 2. Fallback: Parse name from visually hidden accessibility span ("2 mentions, Server Name")
+                    const hiddenSpan = parentItem.querySelector('[class*="hiddenVisually"]');
+                    const hiddenText = hiddenSpan ? hiddenSpan.textContent.trim() : '';
+
+                    if (!serverName && hiddenText) {
+                        serverName = hiddenText.replace(/^\d+\s+mentions?,\s*/i, '').trim();
+                    }
+
+                    // Check for mention badges, unread pills, or accessibility text indicators
+                    const badgeEl = parentItem.querySelector('[class*="numberBadge"], [class*="lowerBadge"]');
+                    const pillEl = parentItem.querySelector('[class*="unreadPill"], [class*="pill"], [class*="item_"]');
+                    const isUnread = badgeEl !== null || pillEl !== null || hiddenText.toLowerCase().includes('mention') || hiddenText.toLowerCase().includes('unread');
+
+                    if (isUnread) {
+                        const mentionCount = badgeEl ? badgeEl.textContent.trim() : null;
+
+                        servers.push({
+                            name: serverName || 'Unknown Server',
+                            id: guildId,
+                            mentionCount: mentionCount,
+                        });
+                    }
+                });
+
+                return { senders, servers };
             });
-            if (unreadSenders.length > 0) {
+
+            if (scanResult.senders.length > 0 || scanResult.servers.length > 0) {
                 const timestamp = new Date().toLocaleString();
-                console.log(`[${timestamp}] [DOM Scan] Found ${unreadSenders.length} unread item(s):`, JSON.stringify(unreadSenders));
+                console.log(`[${timestamp}] [DOM Scan] Found ${scanResult.senders.length} unread DM(s), ${scanResult.servers.length} server mention(s).`);
             }
-            // Process matched unread items through the filter evaluator
-            if (unreadSenders.length > 0) {
-                for (const sender of unreadSenders) {
+
+            // Process matched Direct Messages
+            if (scanResult.senders.length > 0) {
+                for (const sender of scanResult.senders) {
                     if (shouldAlertForSender(sender)) {
                         // Construct enriched notification label including both name and user ID if available
                         const senderLabel = sender.id
@@ -288,7 +451,7 @@ async function startMonitoring() {
 
                         await triggerAlert(
                             'New Filtered Message',
-                            `Incoming direct message from ${senderLabel} on Account B.`
+                            `Incoming direct message from ${senderLabel} on **${currentAccountName}**.`
                         );
                         return; // Exit loop after triggering alert (cooldown will handle subsequent cycles)
                     } else {
@@ -298,8 +461,32 @@ async function startMonitoring() {
                 return;
             }
 
+            // Process matched Server Mentions / Activity
+            if (scanResult.servers.length > 0) {
+                for (const server of scanResult.servers) {
+                    if (shouldAlertForServer(server)) {
+                        const serverLabel = server.id
+                            ? `**${server.name}** (ID: \`${server.id}\`)`
+                            : `**${server.name}**`;
+
+                        const countLabel = server.mentionCount
+                            ? ` (${server.mentionCount} mention${server.mentionCount === '1' ? '' : 's'})`
+                            : '';
+
+                        await triggerAlert(
+                            'New Server Mention',
+                            `Unread activity${countLabel} in ${serverLabel} on **${currentAccountName}**.`
+                        );
+                        return;
+                    } else {
+                        console.log(`[Server Suppressed] Ignored unread activity in server "${server.name}" (ID: ${server.id || 'N/A'}).`);
+                    }
+                }
+                return;
+            }
+
             // Fallback Scanner: Check document title shift (e.g., "(1) Discord") when filtering is disabled
-            if (CONFIG.filterMode === 'DISABLED') {
+            if (CONFIG.filterMode === 'DISABLED' && CONFIG.filterServers.length === 0) {
                 const pageTitle = await page.title();
                 const titleUnreadMatch = pageTitle.match(/^\((\d+)\)\s*Discord/i);
 
@@ -307,7 +494,7 @@ async function startMonitoring() {
                     const unreadCount = titleUnreadMatch[1];
                     await triggerAlert(
                         'New Unread Message',
-                        `Account B detected ${unreadCount} unread notification(s) in document title.`
+                        `Detected ${unreadCount} unread notification(s) in document title for **${currentAccountName}**.`
                     );
                 }
             }
@@ -325,7 +512,7 @@ async function startMonitoring() {
 }
 
 // ==========================================
-// 6. APPLICATION ENTRYPOINT
+// 7. APPLICATION ENTRYPOINT
 // ==========================================
 (async () => {
     try {
