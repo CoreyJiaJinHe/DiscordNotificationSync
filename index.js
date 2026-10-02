@@ -324,6 +324,11 @@ async function startMonitoring() {
     console.log(`[Monitor] DM Filter Configuration -> Mode: ${CONFIG.filterMode} | Targets: [${CONFIG.filterTargets.join(', ')}]`);
     console.log(`[Monitor] Server Filter Targets -> [${CONFIG.filterServers.join(', ')}]`);
 
+    // State trackers to prevent duplicate alerts for existing unread notifications
+    let prevDmKeys = new Set();
+    const prevServerStateMap = new Map(); // Key: server ID/Name -> Value: mention count
+    let prevTitleUnreadCount = 0;
+
     // ------------------------------------------------------------------
     // Passive DOM Polling Loop
     // ------------------------------------------------------------------
@@ -418,10 +423,9 @@ async function startMonitoring() {
 
                     // Check for mention badges, unread pills, or accessibility text indicators
                     const badgeEl = parentItem.querySelector('[class*="numberBadge"], [class*="lowerBadge"]');
-                    const pillEl = parentItem.querySelector('[class*="unreadPill"], [class*="pill"], [class*="item_"]');
-                    const isUnread = badgeEl !== null || pillEl !== null || hiddenText.toLowerCase().includes('mention') || hiddenText.toLowerCase().includes('unread');
+                    const hasMentionText = hiddenText.toLowerCase().includes('mention');
 
-                    if (isUnread) {
+                    if (badgeEl || hasMentionText) {
                         const mentionCount = badgeEl ? badgeEl.textContent.trim() : null;
 
                         servers.push({
@@ -440,48 +444,82 @@ async function startMonitoring() {
                 console.log(`[${timestamp}] [DOM Scan] Found ${scanResult.senders.length} unread DM(s), ${scanResult.servers.length} server mention(s).`);
             }
 
-            // Process matched Direct Messages
-            if (scanResult.senders.length > 0) {
-                for (const sender of scanResult.senders) {
-                    if (shouldAlertForSender(sender)) {
-                        // Construct enriched notification label including both name and user ID if available
-                        const senderLabel = sender.id
-                            ? `**${sender.name || 'User'}** (ID: \`${sender.id}\`)`
-                            : `**${sender.name}**`;
+            // Process matched Direct Messages with state tracking
+            const matchingSenders = scanResult.senders.filter(shouldAlertForSender);
+            const currentDmKeys = new Set();
+            let newSenderToAlert = null;
 
-                        await triggerAlert(
-                            'New Filtered Message',
-                            `Incoming direct message from ${senderLabel} on **${currentAccountName}**.`
-                        );
-                        return; // Exit loop after triggering alert (cooldown will handle subsequent cycles)
-                    } else {
-                        console.log(`[Filter Suppressed] Ignored message from "${sender.name || 'Unknown'}" (ID: ${sender.id || 'N/A'}) matching ${CONFIG.filterMode} rules.`);
+            for (const sender of matchingSenders) {
+                const senderKey = sender.id || sender.name;
+                if (senderKey) {
+                    currentDmKeys.add(senderKey);
+                    if (!prevDmKeys.has(senderKey) && !newSenderToAlert) {
+                        newSenderToAlert = sender;
                     }
                 }
-                return;
             }
 
-            // Process matched Server Mentions / Activity
-            if (scanResult.servers.length > 0) {
-                for (const server of scanResult.servers) {
-                    if (shouldAlertForServer(server)) {
-                        const serverLabel = server.id
-                            ? `**${server.name}** (ID: \`${server.id}\`)`
-                            : `**${server.name}**`;
-
-                        const countLabel = server.mentionCount
-                            ? ` (${server.mentionCount} mention${server.mentionCount === '1' ? '' : 's'})`
-                            : '';
-
-                        await triggerAlert(
-                            'New Server Mention',
-                            `Unread activity${countLabel} in ${serverLabel} on **${currentAccountName}**.`
-                        );
-                        return;
-                    } else {
-                        console.log(`[Server Suppressed] Ignored unread activity in server "${server.name}" (ID: ${server.id || 'N/A'}).`);
-                    }
+            for (const sender of scanResult.senders) {
+                if (!shouldAlertForSender(sender)) {
+                    console.log(`[Filter Suppressed] Ignored message from "${sender.name || 'Unknown'}" matching ${CONFIG.filterMode} rules.`);
                 }
+            }
+
+            if (newSenderToAlert) {
+                prevDmKeys = currentDmKeys;
+                const senderLabel = `**${newSenderToAlert.name || 'User'}**`;
+                await triggerAlert(
+                    'New Filtered Message',
+                    `Incoming direct message from ${senderLabel} on **${currentAccountName}**.`
+                );
+                return;
+            } else {
+                prevDmKeys = currentDmKeys;
+            }
+
+            // Process matched Server Mentions / Activity with state tracking
+            const matchingServers = scanResult.servers.filter(shouldAlertForServer);
+            const currentServerKeys = new Set();
+            let serverToAlert = null;
+
+            for (const server of matchingServers) {
+                const serverKey = server.id || server.name;
+                if (!serverKey) continue;
+                currentServerKeys.add(serverKey);
+
+                const currentCount = parseInt(server.mentionCount, 10) || 1;
+                const prevCount = prevServerStateMap.get(serverKey) || 0;
+
+                if (currentCount > prevCount && !serverToAlert) {
+                    serverToAlert = server;
+                }
+
+                prevServerStateMap.set(serverKey, currentCount);
+            }
+
+            // Clean up servers that no longer have unread activity
+            for (const key of prevServerStateMap.keys()) {
+                if (!currentServerKeys.has(key)) {
+                    prevServerStateMap.delete(key);
+                }
+            }
+
+            for (const server of scanResult.servers) {
+                if (!shouldAlertForServer(server)) {
+                    console.log(`[Server Suppressed] Ignored unread activity in server "${server.name}" (ID: ${server.id || 'N/A'}).`);
+                }
+            }
+
+            if (serverToAlert) {
+                const serverLabel = `**${serverToAlert.name || 'Unknown Server'}**`;
+                const countLabel = serverToAlert.mentionCount
+                    ? ` (${serverToAlert.mentionCount} mention${serverToAlert.mentionCount === '1' ? '' : 's'})`
+                    : '';
+
+                await triggerAlert(
+                    'New Server Mention',
+                    `Unread activity${countLabel} in ${serverLabel} on **${currentAccountName}**.`
+                );
                 return;
             }
 
@@ -489,13 +527,16 @@ async function startMonitoring() {
             if (CONFIG.filterMode === 'DISABLED' && CONFIG.filterServers.length === 0) {
                 const pageTitle = await page.title();
                 const titleUnreadMatch = pageTitle.match(/^\((\d+)\)\s*Discord/i);
+                const currentTitleUnread = titleUnreadMatch ? parseInt(titleUnreadMatch[1], 10) : 0;
 
-                if (titleUnreadMatch) {
-                    const unreadCount = titleUnreadMatch[1];
+                if (currentTitleUnread > prevTitleUnreadCount) {
+                    prevTitleUnreadCount = currentTitleUnread;
                     await triggerAlert(
                         'New Unread Message',
-                        `Detected ${unreadCount} unread notification(s) in document title for **${currentAccountName}**.`
+                        `Detected ${currentTitleUnread} unread notification(s) in document title for **${currentAccountName}**.`
                     );
+                } else {
+                    prevTitleUnreadCount = currentTitleUnread;
                 }
             }
         } catch (err) {
